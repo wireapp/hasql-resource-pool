@@ -1,5 +1,5 @@
 {   # To see the list of available compilers in the current nixpkgs snapshot, run 'make list-ghc-versions'
-    haskellVersion  ? "9102"
+    haskellVersion  ? "9122"
 ,   haskellCompiler ? "ghc"
     # this affects static linking as well as licensing mode,
     # GMP assumes GPL license for the entire project if linked statically
@@ -52,11 +52,15 @@ let
             cacert
             glibcLocales
             gnumake
-            gitAndTools.pre-commit
+            pre-commit
             postgresql
             ghcEnv.ghc
             zlib
-        ] ++ macOsDeps;
+            pkg-config
+        ];
+        buildInputs = with pkgs; [
+            postgresql_18
+        ];
         shellHook = ''
             export PROJECT_PLATFORM="${builtins.currentSystem}"
             export LANG=en_GB.UTF-8

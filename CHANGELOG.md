@@ -1,7 +1,11 @@
+# 1.10.1.0
+
+* Migrate to `Hasql-1.10`
+* Require explicit `idle_in_transaction_session_timeout` and `statement_timeout` setting
+
 # 1.9.1.3
 
 * Support for `resource-pool-0.5.0.0`
-
 
 # 1.9.1.2
 

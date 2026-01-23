@@ -9,7 +9,7 @@ PROJECT_ROOT            := $(PROJECT_MKFILE_DIR)
 LOCAL_UNTRACK_DIR       := $(PROJECT_MKFILE_DIR)/.local
 CABAL_BUILD_DIR			:= $(CABAL_DIR)
 DISTRIBUTIONS           := $(PROJECT_ROOT)/dist-newstyle/sdist
-BACKEND_CABAL_CMD       := CABAL_BUILDDIR=$(CABAL_BUILD_DIR) cabal --project-file=$(PROJECT_ROOT)/cabal.project
+BACKEND_CABAL_CMD       := CABAL_BUILDDIR=$(CABAL_BUILD_DIR) cabal --project-dir=$(PROJECT_ROOT)
 
 
 $(PROJECT_ROOT)/cabal.project.local:

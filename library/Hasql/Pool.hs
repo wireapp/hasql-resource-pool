@@ -7,6 +7,10 @@ module Hasql.Pool
 ,   UsageError(..)
 ,   ConnectionGetter
 ,   Stats(..)
+,   TimeoutSetting(..)
+,   TimeUnit(..)
+,   errorToDetailedMsg
+,   errorIsTransient
 ,   stats
 ,   getPoolUsageStat
 ,   acquire
@@ -26,9 +30,8 @@ import              System.Clock                                (Clock(Monotonic
 
 import              Hasql.Pool.Prelude
 import qualified    Hasql.Connection
-import qualified    Hasql.Connection.Setting
-import qualified    Hasql.Connection.Setting.Connection
-import qualified    Hasql.Connection.Setting.Connection.Param
+import qualified    Hasql.Connection.Settings
+import qualified    Hasql.Errors
 import qualified    Hasql.Session
 import              Hasql.Pool.Observer                         (Observed(..), ObserverAction)
 
@@ -36,7 +39,7 @@ import              Hasql.Pool.Observer                         (Observed(..), O
 -- |
 -- A pool of open DB connections.
 newtype Pool =
-    Pool (ResourcePool.Pool (Either Hasql.Connection.ConnectionError Hasql.Connection.Connection))
+    Pool (ResourcePool.Pool (Either Hasql.Errors.ConnectionError Hasql.Connection.Connection))
 
 
 
@@ -46,7 +49,7 @@ type ResidenceTimeout = NominalDiffTime
 -- |
 -- Connection getter action that allows for obtaining Postgres connection settings
 -- via external resources such as AWS tokens etc.
-type ConnectionGetter = IO (Either Hasql.Connection.ConnectionError Hasql.Connection.Connection)
+type ConnectionGetter = IO (Either Hasql.Errors.ConnectionError Hasql.Connection.Connection)
 
 -- |
 -- Settings of the connection pool. Consist of:
@@ -61,26 +64,56 @@ type ConnectionGetter = IO (Either Hasql.Connection.ConnectionError Hasql.Connec
 --
 type Settings = (PoolSize, ResidenceTimeout, ConnectionSettings)
 
+
+data TimeUnit
+    =  Microseconds
+    |  Milliseconds
+    |  Seconds
+    |  Minutes
+    |  Hours
+    |  Days
+
+-- https://www.postgresql.org/docs/18/config-setting.html#CONFIG-SETTING-NAMES-VALUES
+instance Show TimeUnit where
+    show Microseconds   = "us"
+    show Milliseconds   = "ms"
+    show Seconds        = "s"
+    show Minutes        = "min"
+    show Hours          = "h"
+    show Days           = "d"
+
+
+data TimeoutSetting = TimeoutSetting Word16 TimeUnit
+
+instance Show TimeoutSetting where
+    show (TimeoutSetting v u) = show v <> show u
+
+
 -- | Extended connection settings
 data ConnectionSettings = ConnectionSettings
-    {   host            :: T.Text
-    ,   port            :: Word16
-    ,   user            :: T.Text
-    ,   password        :: T.Text
-    ,   dbName          :: T.Text
-    ,   connAcqTimeout  :: Word16   -- ^ Zero, negative, or not specified means wait indefinitely.
-    ,   sslMode         :: T.Text   -- ^ See https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
-    ,   sslRootCert     :: T.Text   -- ^ See https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT
+    {   host                :: T.Text
+    ,   port                :: Word16
+    ,   user                :: T.Text
+    ,   password            :: T.Text
+    ,   dbName              :: T.Text
+    ,   connAcqTimeout      :: Word16               -- ^ In seconds: zero, negative, or not specified means wait indefinitely. Doesn't support unit suffixes.
+    ,   txIdleTimeout       :: TimeoutSetting       -- ^ Sets explicit `idle_in_transaction_session_timeout`: zero, negative, or not specified means wait indefinitely.
+    ,   stmtTimeout         :: TimeoutSetting       -- ^ Sets explicit `statement_timeout`: zero, negative, or not specified means wait indefinitely.
+    ,   sslMode             :: T.Text               -- ^ See https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
+    ,   sslRootCert         :: T.Text               -- ^ See https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT
     }
 
--- | https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-CONNECT-TIMEOUT
-connectTimeout  = Hasql.Connection.Setting.Connection.Param.other "connect_timeout"
+-- | https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-CONNECT-TIMEOUT
+connectTimeout      = Hasql.Connection.Settings.other "connect_timeout"
 
--- | https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
-sslmode         = Hasql.Connection.Setting.Connection.Param.other "sslmode"
+-- | https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-TRANSACTION-TIMEOUT
+serverOptions = Hasql.Connection.Settings.other "options"
 
--- | https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT
-sslrootcert     = Hasql.Connection.Setting.Connection.Param.other "sslrootcert"
+-- | https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
+sslmode             = Hasql.Connection.Settings.other "sslmode"
+
+-- | https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT
+sslrootcert         = Hasql.Connection.Settings.other "sslrootcert"
 
 
 -- |
@@ -89,28 +122,34 @@ sslrootcert     = Hasql.Connection.Setting.Connection.Param.other "sslrootcert"
 acquire :: Settings -> IO Pool
 acquire settings@(_, _, cset) =
     acquireWith
-        (Hasql.Connection.acquire
-            [   extendedConnectionSettings cset
-            ]
-        )
+        (Hasql.Connection.acquire . extendedConnectionSettings $ cset)
         settings
 
 
 -- | Produce connection settings suitable for acquiring a connection, from an extended set of parameters covering ssl options.
-extendedConnectionSettings :: ConnectionSettings -> Hasql.Connection.Setting.Setting
+extendedConnectionSettings :: ConnectionSettings -> Hasql.Connection.Settings.Settings
 extendedConnectionSettings cset = 
-    Hasql.Connection.Setting.connection
-        ( Hasql.Connection.Setting.Connection.params
-            [   Hasql.Connection.Setting.Connection.Param.host      cset.host
-            ,   Hasql.Connection.Setting.Connection.Param.port      cset.port
-            ,   Hasql.Connection.Setting.Connection.Param.user      cset.user
-            ,   Hasql.Connection.Setting.Connection.Param.password  cset.password
-            ,   Hasql.Connection.Setting.Connection.Param.dbname    cset.dbName
-            ,   (connectTimeout . T.pack . show)                    cset.connAcqTimeout
-            ,   sslmode                                             cset.sslMode
-            ,   sslrootcert                                         cset.sslRootCert
-            ]
-        )
+    foldl' (<>) mempty
+        [   Hasql.Connection.Settings.hostAndPort               cset.host cset.port
+        ,   Hasql.Connection.Settings.user                      cset.user
+        ,   Hasql.Connection.Settings.password                  cset.password
+        ,   Hasql.Connection.Settings.dbname                    cset.dbName
+        ,   (connectTimeout . T.pack . show)                    cset.connAcqTimeout                
+        ,   sslmode                                             cset.sslMode
+        ,   sslrootcert                                         cset.sslRootCert
+        ,   serverOptions
+                (serverOpts
+                        -- https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+                    [   ("idle_in_transaction_session_timeout", T.pack $ show cset.txIdleTimeout)
+                        -- https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-STATEMENT-TIMEOUT
+                    ,   ("statement_timeout",                   T.pack $ show cset.stmtTimeout)
+                    ]
+                )
+        ]
+
+
+serverOpts :: [(T.Text,  T.Text)] -> T.Text
+serverOpts = foldl' (\acc (k ,v) -> acc <> " -c " <> k <> "=" <> v) mempty
 
 
 -- |
@@ -144,8 +183,8 @@ release (Pool pool) =
 -- |
 -- A union over the connection establishment error and the session error.
 data UsageError
-    =   ConnectionError Hasql.Connection.ConnectionError
-    |   SessionError    Hasql.Session.SessionError
+    =   ConnectionError Hasql.Errors.ConnectionError
+    |   SessionError    Hasql.Errors.SessionError
     deriving (Show, Eq)
 
 -- |
@@ -167,7 +206,7 @@ useWithObserver observer (Pool pool) session =
     where
         runQuery dbConn = maybe action (runWithObserver action) observer
             where
-                action = Hasql.Session.run session dbConn
+                action = Hasql.Connection.use dbConn session
 
         runWithObserver action doObserve = do
             let measure = getTime Monotonic
@@ -224,4 +263,8 @@ stats (Pool pool) = currentlyAvailablePerStripe >>= collect where
 
 
 getPoolUsageStat :: Pool -> IO PoolSize
-getPoolUsageStat pool = stats pool >>= (pure . currentUsage)
+getPoolUsageStat pool = currentUsage <$> stats pool
+
+
+errorToDetailedMsg = Hasql.Errors.toDetailedText
+errorIsTransient   = Hasql.Errors.isTransient
