@@ -5,3 +5,4 @@ dist-newstyle/
 result
 hls.exe
 cabal.project.local*
+.DS_*
