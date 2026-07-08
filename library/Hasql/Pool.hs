@@ -18,6 +18,8 @@ module Hasql.Pool
 ,   release
 ,   use
 ,   useWithObserver
+,   useWithPoolAcquisitionTimeout
+,   useWithObserverAndPoolAcquisitionTimeout
 ,   withResourceOnEither
 ,   extendedConnectionSettings
 )
@@ -128,13 +130,13 @@ acquire settings@(_, _, cset) =
 
 -- | Produce connection settings suitable for acquiring a connection, from an extended set of parameters covering ssl options.
 extendedConnectionSettings :: ConnectionSettings -> Hasql.Connection.Settings.Settings
-extendedConnectionSettings cset = 
+extendedConnectionSettings cset =
     foldl' (<>) mempty
         [   Hasql.Connection.Settings.hostAndPort               cset.host cset.port
         ,   Hasql.Connection.Settings.user                      cset.user
         ,   Hasql.Connection.Settings.password                  cset.password
         ,   Hasql.Connection.Settings.dbname                    cset.dbName
-        ,   (connectTimeout . T.pack . show)                    cset.connAcqTimeout                
+        ,   (connectTimeout . T.pack . show)                    cset.connAcqTimeout
         ,   sslmode                                             cset.sslMode
         ,   sslrootcert                                         cset.sslRootCert
         ,   serverOptions
@@ -163,6 +165,13 @@ acquireWith connGetter (maxSize, sTimeout, _connectionSettings) =
         releaseConn = either (const (pure ())) Hasql.Connection.release
 
 
+acquisitionTimeoutMicros :: Word16 -> Maybe Int
+acquisitionTimeoutMicros 0 =
+    Nothing
+acquisitionTimeoutMicros seconds =
+    Just (fromIntegral seconds * 1000000)
+
+
 createPool :: IO a
            -> (a -> IO ())
            -> NominalDiffTime
@@ -183,7 +192,8 @@ release (Pool pool) =
 -- |
 -- A union over the connection establishment error and the session error.
 data UsageError
-    =   ConnectionError Hasql.Errors.ConnectionError
+    =   AcquisitionTimeoutUsageError
+    |   ConnectionError Hasql.Errors.ConnectionError
     |   SessionError    Hasql.Errors.SessionError
     deriving (Show, Eq)
 
@@ -194,15 +204,36 @@ use :: Pool -> Hasql.Session.Session a -> IO (Either UsageError a)
 use = useWithObserver Nothing
 
 -- |
+-- Same as 'use' but bounds the time spent waiting for an available pool slot.
+-- The timeout is in seconds; zero means wait indefinitely.
+useWithPoolAcquisitionTimeout :: Word16
+                              -> Pool
+                              -> Hasql.Session.Session a
+                              -> IO (Either UsageError a)
+useWithPoolAcquisitionTimeout =
+    useWithObserverAndPoolAcquisitionTimeout Nothing
+
+-- |
 -- Same as 'use' but allows for a custom observer action. You can use it for gathering latency metrics.
 useWithObserver :: Maybe ObserverAction
                 -> Pool
                 -> Hasql.Session.Session a
                 -> IO (Either UsageError a)
-useWithObserver observer (Pool pool) session =
-    fmap (either (Left . ConnectionError) (either (Left . SessionError) Right)) $
-    withResourceOnEither pool $
-    traverse runQuery
+useWithObserver observer =
+    useWithObserverAndPoolAcquisitionTimeout observer 0
+
+-- |
+-- Same as 'useWithObserver' but bounds the time spent waiting for an available pool slot.
+-- The timeout is in seconds; zero means wait indefinitely.
+useWithObserverAndPoolAcquisitionTimeout :: Maybe ObserverAction
+                                         -> Word16
+                                         -> Pool
+                                         -> Hasql.Session.Session a
+                                         -> IO (Either UsageError a)
+useWithObserverAndPoolAcquisitionTimeout observer poolAcquisitionTimeout (Pool pool) session =
+    fmap (either Left (either (Left . SessionError) Right)) $
+    withResourceOnEitherTimeout (acquisitionTimeoutMicros poolAcquisitionTimeout) AcquisitionTimeoutUsageError pool $
+    either (pure . Left . ConnectionError) (fmap Right . runQuery)
     where
         runQuery dbConn = maybe action (runWithObserver action) observer
             where
@@ -232,6 +263,83 @@ withResourceOnEither pool act = mask_ $ do
         Left failure -> do
             ResourcePool.destroyResource pool localPool resource
             pure $ Left failure
+
+
+withResourceOnEitherTimeout :: Maybe Int
+                            -> failure
+                            -> ResourcePool.Pool resource
+                            -> (resource -> IO (Either failure success))
+                            -> IO (Either failure success)
+withResourceOnEitherTimeout Nothing _ pool act =
+    withResourceOnEither pool act
+withResourceOnEitherTimeout (Just acquisitionTimeout) timeoutFailure pool act = mask $ \restore -> do
+    resourceOrTimeout <- takeResourceWithin acquisitionTimeout pool
+    case resourceOrTimeout of
+        Nothing ->
+            pure $ Left timeoutFailure
+        Just (resource, localPool) -> do
+            failureOrSuccess <- restore (act resource) `onException` ResourcePool.destroyResource pool localPool resource
+            case failureOrSuccess of
+                Right success -> do
+                    ResourcePool.putResource localPool resource
+                    pure $ Right success
+                Left failure -> do
+                    ResourcePool.destroyResource pool localPool resource
+                    pure $ Left failure
+
+
+-- We cannot implement this as `timeout acquisitionTimeout (ResourcePool.takeResource pool)`.
+-- In practice that waits until resource-pool eventually returns a resource in exhausted-pool
+-- scenarios. Instead, mirror resource-pool's checkout logic and race availability against
+-- our timeout in STM, like hasql-pool does.
+takeResourceWithin :: Int
+                   -> ResourcePool.Pool resource
+                   -> IO (Maybe (resource, ResourcePool.LocalPool resource))
+takeResourceWithin acquisitionTimeout pool = mask_ $ do
+    delay <- newDelay acquisitionTimeout
+    localPool <- Unstable.getLocalPool (Unstable.localPools pool)
+    join . atomically $
+        asum
+            [ do
+                stripe <- readTVar (Unstable.stripeVar localPool)
+                case stripe of
+                    Unstable.Stripe 0 _ _ _ ->
+                        retry
+                    _ ->
+                        fmap Just <$> takeAvailableResource pool localPool stripe
+            , do
+                timedOut <- readTVar delay
+                if timedOut
+                    then pure $ pure Nothing
+                    else retry
+            ]
+
+
+newDelay :: Int -> IO (TVar Bool)
+newDelay delayMicros = do
+    delay <- newTVarIO False
+    void . forkIO $ do
+        threadDelay delayMicros
+        atomically $ writeTVar delay True
+    pure delay
+
+
+takeAvailableResource :: ResourcePool.Pool resource
+                      -> ResourcePool.LocalPool resource
+                      -> Unstable.Stripe resource
+                      -> STM (IO (resource, ResourcePool.LocalPool resource))
+takeAvailableResource pool localPool (Unstable.Stripe available cached queue queueR) =
+    case cached of
+        [] -> do
+            writeTVar (Unstable.stripeVar localPool) $! Unstable.Stripe (available - 1) cached queue queueR
+            pure $ do
+                resource <-
+                    Unstable.createResource (Unstable.poolConfig pool)
+                        `onException` Unstable.restoreSize (Unstable.stripeVar localPool)
+                pure (resource, localPool)
+        Unstable.Entry resource _ : remainingCached -> do
+            writeTVar (Unstable.stripeVar localPool) $! Unstable.Stripe (available - 1) remainingCached queue queueR
+            pure $ pure (resource, localPool)
 
 
 data Stats = Stats
@@ -266,5 +374,21 @@ getPoolUsageStat :: Pool -> IO PoolSize
 getPoolUsageStat pool = currentUsage <$> stats pool
 
 
-errorToDetailedMsg = Hasql.Errors.toDetailedText
-errorIsTransient   = Hasql.Errors.isTransient
+errorToDetailedMsg :: UsageError -> T.Text
+errorToDetailedMsg = \case
+    AcquisitionTimeoutUsageError ->
+        "Connection acquisition timeout"
+    ConnectionError err ->
+        Hasql.Errors.toDetailedText err
+    SessionError err ->
+        Hasql.Errors.toDetailedText err
+
+
+errorIsTransient :: UsageError -> Bool
+errorIsTransient = \case
+    AcquisitionTimeoutUsageError ->
+        True
+    ConnectionError err ->
+        Hasql.Errors.isTransient err
+    SessionError err ->
+        Hasql.Errors.isTransient err
