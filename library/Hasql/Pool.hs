@@ -166,11 +166,12 @@ acquireWith connGetter (maxSize, sTimeout, _connectionSettings) =
         releaseConn = either (const (pure ())) Hasql.Connection.release
 
 
-acquisitionTimeoutMicros :: Word16 -> Maybe Int
-acquisitionTimeoutMicros 0 =
-    Nothing
-acquisitionTimeoutMicros seconds =
-    Just (fromIntegral seconds * 1000000)
+acquisitionTimeoutMicros :: Int -> Maybe Int
+acquisitionTimeoutMicros seconds
+    | seconds <= 0 =
+        Nothing
+    | otherwise =
+        Just $ min (maxBound :: Int) (fromInteger (toInteger seconds * 1000000))
 
 
 createPool :: IO a
@@ -207,7 +208,7 @@ use = useWithObserver Nothing
 -- |
 -- Same as 'use' but bounds the time spent waiting for an available pool slot.
 -- The timeout is in seconds; zero means wait indefinitely.
-useWithPoolAcquisitionTimeout :: Word16
+useWithPoolAcquisitionTimeout :: Int
                               -> Pool
                               -> Hasql.Session.Session a
                               -> IO (Either UsageError a)
@@ -227,7 +228,7 @@ useWithObserver observer =
 -- Same as 'useWithObserver' but bounds the time spent waiting for an available pool slot.
 -- The timeout is in seconds; zero means wait indefinitely.
 useWithObserverAndPoolAcquisitionTimeout :: Maybe ObserverAction
-                                         -> Word16
+                                         -> Int
                                          -> Pool
                                          -> Hasql.Session.Session a
                                          -> IO (Either UsageError a)
@@ -258,7 +259,7 @@ useWithObserverAndPoolAcquisitionTimeout observer poolAcquisitionTimeout (Pool p
 -- operations, for example while managing their own transaction state.
 --
 -- The timeout is in seconds; zero means wait indefinitely.
-withConnectionWithPoolAcquisitionTimeout :: Word16
+withConnectionWithPoolAcquisitionTimeout :: Int
                                          -> Pool
                                          -> (Hasql.Connection.Connection -> IO (Either UsageError a))
                                          -> IO (Either UsageError a)
