@@ -20,6 +20,7 @@ module Hasql.Pool
 ,   useWithObserver
 ,   useWithPoolAcquisitionTimeout
 ,   useWithObserverAndPoolAcquisitionTimeout
+,   withConnectionWithPoolAcquisitionTimeout
 ,   withResourceOnEither
 ,   extendedConnectionSettings
 )
@@ -248,6 +249,22 @@ useWithObserverAndPoolAcquisitionTimeout observer poolAcquisitionTimeout (Pool p
                 observed = Observed {   latency = toRational (toNanoSecs (end `diffTimeSpec` start) % nsRatio)
                                     }
             doObserve observed >> pure result
+
+
+-- |
+-- Borrow a live connection from the pool and run a callback with it.
+--
+-- This is useful for libraries that need to pin one connection across multiple
+-- operations, for example while managing their own transaction state.
+--
+-- The timeout is in seconds; zero means wait indefinitely.
+withConnectionWithPoolAcquisitionTimeout :: Word16
+                                         -> Pool
+                                         -> (Hasql.Connection.Connection -> IO (Either UsageError a))
+                                         -> IO (Either UsageError a)
+withConnectionWithPoolAcquisitionTimeout poolAcquisitionTimeout (Pool pool) act =
+    withResourceOnEitherTimeout (acquisitionTimeoutMicros poolAcquisitionTimeout) AcquisitionTimeoutUsageError pool $
+    either (pure . Left . ConnectionError) act
 
 
 withResourceOnEither :: ResourcePool.Pool resource

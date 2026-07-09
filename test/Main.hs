@@ -37,6 +37,12 @@ successfulSession =
     successfulStatement = Statement.preparable "SELECT 1::int8" Encoders.noParams decoder
 
 
+runSuccessfulSessionWithConnection :: Connection.Connection -> IO (Either Pool.UsageError Int64)
+runSuccessfulSessionWithConnection conn =
+  fmap (either (Left . Pool.SessionError) Right) $
+    Connection.use conn successfulSession
+
+
 main = hspec $ do
   describe "Hasql.Pool.use" $ do
     it "releases a spot in the pool when there is an error" $ do
@@ -61,5 +67,26 @@ main = hspec $ do
 
       takeMVar connectionStarted
       Pool.useWithPoolAcquisitionTimeout 1 pool successfulSession `shouldReturn` (Left Pool.AcquisitionTimeoutUsageError)
+      putMVar releaseConnection ()
+      takeMVar holderDone `shouldReturn` Right 1
+
+    it "borrows a raw connection from the pool" $ do
+      pool <- Pool.acquire testSettings
+      Pool.withConnectionWithPoolAcquisitionTimeout 1 pool runSuccessfulSessionWithConnection `shouldReturn` (Right 1)
+
+    it "times out while waiting to borrow a raw connection" $ do
+      connectionStarted <- newEmptyMVar
+      releaseConnection <- newEmptyMVar
+      let (_, _, connectionSettings) = testSettings
+          connectionGetter = do
+            putMVar connectionStarted ()
+            takeMVar releaseConnection
+            Connection.acquire (Pool.extendedConnectionSettings connectionSettings)
+      pool <- Pool.acquireWith connectionGetter testSettings
+      holderDone <- newEmptyMVar
+      _ <- forkIO $ Pool.withConnectionWithPoolAcquisitionTimeout 1 pool runSuccessfulSessionWithConnection >>= putMVar holderDone
+
+      takeMVar connectionStarted
+      Pool.withConnectionWithPoolAcquisitionTimeout 1 pool runSuccessfulSessionWithConnection `shouldReturn` (Left Pool.AcquisitionTimeoutUsageError)
       putMVar releaseConnection ()
       takeMVar holderDone `shouldReturn` Right 1
