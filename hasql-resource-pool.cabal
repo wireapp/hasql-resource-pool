@@ -73,9 +73,10 @@ library
         Hasql.Pool.Prelude
     build-depends:
         -- resources:
-        ,   resource-pool >= 0.5.0.0 && < 0.6
+        ,   pqi ^>=1.1.0.1
+        ,   resource-pool >= 0.5.1.0 && < 0.6
         -- database:
-        ,   hasql         >= 1.10.1
+        ,   hasql         >= 2.0 && < 2.1
         -- data:
         ,   time          >= 1.5 && < 2
         ,   clock         >= 0.8 && < 1

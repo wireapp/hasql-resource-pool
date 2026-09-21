@@ -37,6 +37,7 @@ import qualified    Hasql.Connection.Settings
 import qualified    Hasql.Errors
 import qualified    Hasql.Session
 import              Hasql.Pool.Observer                         (Observed(..), ObserverAction)
+import              Pqi
 
 
 -- |
@@ -122,10 +123,10 @@ sslrootcert         = Hasql.Connection.Settings.other "sslrootcert"
 -- |
 -- Given the pool-size, timeout and connection settings
 -- create a connection-pool.
-acquire :: Settings -> IO Pool
-acquire settings@(_, _, cset) =
+acquire :: Adapter -> Settings -> IO Pool
+acquire adapter settings@(_, _, cset) =
     acquireWith
-        (Hasql.Connection.acquire . extendedConnectionSettings $ cset)
+        (Hasql.Connection.acquire adapter . extendedConnectionSettings $ cset)
         settings
 
 
@@ -353,7 +354,7 @@ takeAvailableResource pool localPool (Unstable.Stripe available cached queue que
             pure $ do
                 resource <-
                     Unstable.createResource (Unstable.poolConfig pool)
-                        `onException` Unstable.restoreSize (Unstable.stripeVar localPool)
+                        `onException` Unstable.restoreSize localPool
                 pure (resource, localPool)
         Unstable.Entry resource _ : remainingCached -> do
             writeTVar (Unstable.stripeVar localPool) $! Unstable.Stripe (available - 1) remainingCached queue queueR
