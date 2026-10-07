@@ -37,6 +37,7 @@ import qualified    Hasql.Connection.Settings
 import qualified    Hasql.Errors
 import qualified    Hasql.Session
 import              Hasql.Pool.Observer                         (Observed(..), ObserverAction)
+import qualified    Hasql.Pool.SessionErrorDestructors          as SessionErrorDestructors
 import              Pqi
 
 
@@ -236,8 +237,18 @@ useWithObserverAndPoolAcquisitionTimeout :: Maybe ObserverAction
 useWithObserverAndPoolAcquisitionTimeout observer poolAcquisitionTimeout (Pool pool) session =
     fmap (either Left (either (Left . SessionError) Right)) $
     withResourceOnEitherTimeout (acquisitionTimeoutMicros poolAcquisitionTimeout) AcquisitionTimeoutUsageError pool $
-    either (pure . Left . ConnectionError) (fmap Right . runQuery)
+    either (pure . Left . ConnectionError) runQueryCheckingConnectionError
     where
+        runQueryCheckingConnectionError dbConn = do
+            result <- runQuery dbConn
+            pure $ case result of
+                Left err | SessionErrorDestructors.requiresConnectionDiscard err ->
+                    Left (SessionError err)
+                Left err ->
+                    Right (Left err)
+                Right a ->
+                    Right (Right a)
+
         runQuery dbConn = maybe action (runWithObserver action) observer
             where
                 action = Hasql.Connection.use dbConn session
